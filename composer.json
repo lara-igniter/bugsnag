@@ -1,0 +1,36 @@
+{
+    "name": "lara-igniter/bugsnag",
+    "description": "Bugsnag error tracking for the Laraigniter framework.",
+    "version": "1.0.0",
+    "keywords": ["laraigniter", "bugsnag", "exceptions", "errors", "logging"],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "George Tsachrelias",
+            "email": "george@laraigniter.com"
+        }
+    ],
+    "require": {
+        "php": "^7.4|^8.0",
+        "bugsnag/bugsnag": "^3.29",
+        "bugsnag/bugsnag-psr-logger": "^1.4|^2.0",
+        "lara-igniter/framework": "^1.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Laraigniter\\Bugsnag\\": "src/"
+        },
+        "files": [
+            "src/helpers.php"
+        ]
+    },
+    "extra": {
+        "laraigniter": {
+            "providers": [
+                "Laraigniter\\Bugsnag\\BugsnagServiceProvider"
+            ]
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
