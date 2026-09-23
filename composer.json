@@ -1,8 +1,13 @@
 {
     "name": "lara-igniter/bugsnag",
     "description": "Bugsnag error tracking for the Laraigniter framework.",
-    "version": "1.0.0",
-    "keywords": ["laraigniter", "bugsnag", "exceptions", "errors", "logging"],
+    "keywords": [
+        "laraigniter",
+        "bugsnag",
+        "exceptions",
+        "errors",
+        "logging"
+    ],
     "license": "MIT",
     "authors": [
         {
