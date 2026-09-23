@@ -1,6 +1,28 @@
 <?php
 
 use Laraigniter\Bugsnag\BugsnagManager;
+use Laraigniter\Bugsnag\Logging\QueryErrorReporter;
+
+if (!function_exists('log_message')) {
+    /**
+     * Capture CI database query failures for Bugsnag before the log write.
+     *
+     * Loaded via Composer before CodeIgniter's Common.php so SQL errors that
+     * only hit the log (or precede display_error) are still reported.
+     */
+    function log_message($level, $message)
+    {
+        QueryErrorReporter::capture($level, $message);
+
+        static $_log;
+
+        if ($_log === null) {
+            $_log[0] =& load_class('Log', 'core');
+        }
+
+        $_log[0]->write_log($level, $message);
+    }
+}
 
 if (!function_exists('bugsnag')) {
     /**
@@ -54,6 +76,7 @@ if (!function_exists('bugsnag_report')) {
 
         if ($client) {
             $client->notifyException($exception);
+            $client->flush();
         }
     }
 }

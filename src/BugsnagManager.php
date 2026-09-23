@@ -88,6 +88,7 @@ class BugsnagManager
         }
 
         $this->client->notifyException($exception, $callback);
+        $this->client->flush();
     }
 
     /**

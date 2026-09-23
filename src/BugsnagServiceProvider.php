@@ -7,16 +7,23 @@ use Bugsnag\Client;
 use Bugsnag\Configuration;
 use Bugsnag\PsrLogger\BugsnagLogger;
 use Bugsnag\Report;
+use Elegant\Contracts\Debug\ExceptionHandler as ExceptionHandlerContract;
 use Elegant\Contracts\Hook\Boot;
 use Elegant\Contracts\Hook\PostControllerConstructor;
+use Elegant\Contracts\Hook\PostSystem;
 use Elegant\Contracts\Hook\PreSystem;
 use Elegant\Foundation\Application;
+use Elegant\Foundation\Exceptions\Handler as ExceptionHandler;
+use Elegant\Foundation\Http\Kernel;
 use Elegant\Support\ServiceProvider;
+use GuzzleHttp\HandlerStack;
+use Laraigniter\Bugsnag\Logging\QueryErrorReporter;
 use Laraigniter\Bugsnag\Middleware\UnhandledState;
 use Laraigniter\Bugsnag\Request\LaraigniterResolver;
+use Psr\Log\LoggerInterface;
 use Throwable;
 
-class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem, PostControllerConstructor
+class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem, PostControllerConstructor, PostSystem
 {
     /**
      * The package version.
@@ -32,6 +39,13 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
      */
     protected static $exceptionHandlerRegistered = false;
 
+    /**
+     * Whether the Kernel exception handler reportable callback was registered.
+     *
+     * @var bool
+     */
+    protected static $reportableRegistered = false;
+
     public function boot(): void
     {
         $this->publishes([
@@ -41,17 +55,21 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
 
     public function preSystem(): void
     {
-        // handleException / handleShutdown are already registered by CodeIgniter
-        // before pre_system. Wrapping here covers uncaught errors during routing
-        // and controller loading — before post_controller_constructor runs.
-        $apiKey = env('BUGSNAG_API_KEY', '');
+        // Apache/PHP-FPM workers reuse static state across requests. start.php
+        // resets set_exception_handler('handleException') on every request, so we
+        // must re-wrap the handler and re-bind reporting each time.
+        static::$exceptionHandlerRegistered = false;
+        static::$reportableRegistered = false;
 
-        if ($apiKey === '' || $apiKey === null) {
+        $apiKey = $this->resolveApiKey();
+
+        if ($apiKey === '') {
             return;
         }
 
         $client = $this->makeClient($this->configFromEnvironment());
         BugsnagManager::setStaticClient($client);
+        $this->registerExceptionReporting(new BugsnagLogger($client));
         $this->registerExceptionHandler();
     }
 
@@ -73,10 +91,94 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
 
         app('bugsnag', $manager);
         app('bugsnag.client', $client);
-        app('bugsnag.logger', new BugsnagLogger($client));
 
-        $this->registerExceptionHandler();
+        $logger = new BugsnagLogger($client);
+        app('bugsnag.logger', $logger);
+        $this->registerExceptionReporting($logger);
         $this->startSessionIfNeeded($client, $config);
+    }
+
+    public function postSystem(): void
+    {
+        try {
+            $client = BugsnagManager::staticClient();
+
+            if ($client instanceof Client) {
+                $client->flush();
+            }
+        } catch (Throwable $ignored) {
+            //
+        }
+    }
+
+    /**
+     * Wire Bugsnag into the HTTP Kernel exception handler.
+     */
+    protected function registerExceptionReporting(BugsnagLogger $logger): void
+    {
+        $this->bindPsrLogger($logger);
+        $this->registerReportableCallback();
+    }
+
+    /**
+     * Bind Bugsnag as the PSR logger resolved by Handler::report().
+     *
+     * The HTTP Kernel catches controller exceptions and reports them through
+     * App\Exceptions\Handler, which resolves Psr\Log\LoggerInterface from the
+     * Laraigniter Application container — not via set_exception_handler.
+     */
+    protected function bindPsrLogger(BugsnagLogger $logger): void
+    {
+        $kernel = Kernel::getInstance();
+
+        if ($kernel === null) {
+            return;
+        }
+
+        $app = $kernel->getApplication();
+        $app->instance(LoggerInterface::class, $logger);
+
+        try {
+            $handler = $app->make(ExceptionHandlerContract::class);
+
+            if ($handler instanceof ExceptionHandler) {
+                ExceptionHandler::setResolvedInstance($handler);
+            }
+        } catch (Throwable $ignored) {
+            //
+        }
+    }
+
+    /**
+     * Report exceptions caught by the HTTP Kernel through Handler::report().
+     */
+    protected function registerReportableCallback(): void
+    {
+        if (static::$reportableRegistered) {
+            return;
+        }
+
+        $kernel = Kernel::getInstance();
+
+        if ($kernel === null) {
+            return;
+        }
+
+        try {
+            $handler = $kernel->getApplication()->make(ExceptionHandlerContract::class);
+
+            $handler->reportable(static function (Throwable $e) {
+                if (QueryErrorReporter::shouldSkipException($e)) {
+                    return false;
+                }
+
+                return static::notifyThrowable($e) ? false : null;
+            });
+
+            static::$reportableRegistered = true;
+        } catch (Throwable $ignored) {
+            //
+        }
     }
 
     /**
@@ -108,7 +210,7 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
         $client->setFallbackType($this->isCli() ? 'Console' : 'HTTP');
         $client->setAppType($config['app_type'] ?? null);
         $client->setAppVersion($config['app_version'] ?? Application::VERSION);
-        $client->setBatchSending(array_key_exists('batch_sending', $config) ? (bool) $config['batch_sending'] : true);
+        $client->setBatchSending(array_key_exists('batch_sending', $config) ? (bool) $config['batch_sending'] : false);
         $client->setSendCode(array_key_exists('send_code', $config) ? (bool) $config['send_code'] : true);
 
         $client->getPipeline()->insertBefore(new UnhandledState(), 'Bugsnag\\Middleware\\SessionData');
@@ -288,14 +390,8 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
 
         $previous = set_exception_handler(static function ($throwable) use (&$previous) {
             try {
-                $client = BugsnagManager::staticClient();
-
-                if ($client instanceof Client) {
-                    $report = Report::fromPHPThrowable($client->getConfig(), $throwable);
-                    $report->setUnhandled(true);
-                    $report->setSeverity('error');
-                    $report->setSeverityReason(['type' => 'unhandledException']);
-                    $client->notify($report);
+                if (! QueryErrorReporter::shouldSkipException($throwable)) {
+                    static::notifyThrowable($throwable, true);
                 }
             } catch (Throwable $e) {
                 // Never break the framework error page.
@@ -313,6 +409,34 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
     }
 
     /**
+     * Resolve the Bugsnag API key from env() and superglobals.
+     */
+    protected function resolveApiKey(): string
+    {
+        $key = env('BUGSNAG_API_KEY', '');
+
+        if ($key !== '' && $key !== null) {
+            return (string) $key;
+        }
+
+        $key = getenv('BUGSNAG_API_KEY');
+
+        if ($key !== false && $key !== '') {
+            return (string) $key;
+        }
+
+        if (isset($_ENV['BUGSNAG_API_KEY']) && $_ENV['BUGSNAG_API_KEY'] !== '') {
+            return (string) $_ENV['BUGSNAG_API_KEY'];
+        }
+
+        if (isset($_SERVER['BUGSNAG_API_KEY']) && $_SERVER['BUGSNAG_API_KEY'] !== '') {
+            return (string) $_SERVER['BUGSNAG_API_KEY'];
+        }
+
+        return '';
+    }
+
+    /**
      * Minimal config available during pre_system (env only).
      */
     protected function configFromEnvironment(): array
@@ -320,14 +444,14 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
         $notifyStages = env('BUGSNAG_NOTIFY_RELEASE_STAGES');
 
         return [
-            'api_key' => env('BUGSNAG_API_KEY', ''),
+            'api_key' => $this->resolveApiKey(),
             'app_type' => env('BUGSNAG_APP_TYPE', 'web'),
             'app_version' => env('BUGSNAG_APP_VERSION', Application::VERSION),
             'release_stage' => env('BUGSNAG_RELEASE_STAGE', defined('ENVIRONMENT') ? ENVIRONMENT : 'production'),
             'notify_release_stages' => empty($notifyStages)
                 ? ['production', 'staging']
                 : explode(',', str_replace(' ', '', $notifyStages)),
-            'batch_sending' => filter_var(env('BUGSNAG_BATCH_SENDING', true), FILTER_VALIDATE_BOOLEAN),
+            'batch_sending' => filter_var(env('BUGSNAG_BATCH_SENDING', false), FILTER_VALIDATE_BOOLEAN),
             'send_code' => filter_var(env('BUGSNAG_SEND_CODE', true), FILTER_VALIDATE_BOOLEAN),
             'endpoint' => env('BUGSNAG_ENDPOINT'),
             'session_endpoint' => env('BUGSNAG_SESSION_ENDPOINT', env('BUGSNAG_SESSIONS_ENDPOINT')),
@@ -350,9 +474,97 @@ class BugsnagServiceProvider extends ServiceProvider implements Boot, PreSystem,
         ];
     }
 
+    /**
+     * Notify Bugsnag immediately. Returns false when nothing was sent so
+     * Handler::report() can still fall through to the PSR logger.
+     */
+    protected static function notifyThrowable(Throwable $throwable, bool $unhandled = false): bool
+    {
+        $client = BugsnagManager::staticClient();
+
+        if (!$client instanceof Client) {
+            static::logDelivery('Bugsnag client is not registered');
+
+            return false;
+        }
+
+        if (!$client->shouldNotify()) {
+            $appData = $client->getConfig()->getAppData();
+            static::logDelivery('Bugsnag skipped notification for release stage ['.($appData['releaseStage'] ?? '').']');
+
+            return false;
+        }
+
+        try {
+            $report = Report::fromPHPThrowable($client->getConfig(), $throwable);
+            static::normalizeDatabaseMessage($report);
+
+            if ($unhandled) {
+                $report->setUnhandled(true);
+                $report->setSeverity('error');
+                $report->setSeverityReason(['type' => 'unhandledException']);
+            }
+
+            $client->notify($report);
+            $client->flush();
+
+            return true;
+        } catch (Throwable $e) {
+            static::logDelivery('Bugsnag notify failed: '.$e->getMessage());
+
+            return false;
+        }
+    }
+
+    /**
+     * CI display_error() throws the SQL error as HTML paragraphs.
+     */
+    protected static function normalizeDatabaseMessage(Report $report): void
+    {
+        $message = $report->getMessage();
+
+        if (! is_string($message) || strpos($message, '<p>') === false) {
+            return;
+        }
+
+        $text = str_replace(['</p>', '<br>', '<br/>', '<br />'], "\n", $message);
+        $text = html_entity_decode(strip_tags($text), ENT_QUOTES, 'UTF-8');
+        $text = trim((string) preg_replace("/[ \t]*\n[ \t]*/", "\n", $text));
+
+        if ($text !== '') {
+            $report->setMessage($text);
+        }
+    }
+
+    protected static function logDelivery(string $message): void
+    {
+        if (function_exists('log_message')) {
+            log_message('error', $message);
+        }
+    }
+
     protected function guzzleOptions(array $config): array
     {
-        $options = [];
+        $stack = HandlerStack::create();
+        $stack->push(static function (callable $handler) {
+            return static function ($request, array $options) use ($handler) {
+                return $handler($request, $options)->then(null, static function ($reason) {
+                    $message = $reason instanceof Throwable ? $reason->getMessage() : (string) $reason;
+
+                    if (function_exists('log_message')) {
+                        log_message('error', 'Bugsnag delivery failed: '.$message);
+                    }
+
+                    if ($reason instanceof Throwable) {
+                        throw $reason;
+                    }
+
+                    throw new \RuntimeException($message);
+                });
+            };
+        });
+
+        $options = ['handler' => $stack];
 
         if (!empty($config['proxy']) && is_array($config['proxy'])) {
             $proxy = $config['proxy'];

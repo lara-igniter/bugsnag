@@ -38,7 +38,7 @@ $config = [
     |--------------------------------------------------------------------------
     */
 
-    'batch_sending' => filter_var(env('BUGSNAG_BATCH_SENDING', true), FILTER_VALIDATE_BOOLEAN),
+    'batch_sending' => filter_var(env('BUGSNAG_BATCH_SENDING', false), FILTER_VALIDATE_BOOLEAN),
 
     'send_code' => filter_var(env('BUGSNAG_SEND_CODE', true), FILTER_VALIDATE_BOOLEAN),
 
